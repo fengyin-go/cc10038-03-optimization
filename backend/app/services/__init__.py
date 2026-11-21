@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from app.services.base import BaseModuleService
 from app.services.source_registry import SourceRegistryService
+from app.services.verification_receipt import VerificationReceiptService
 from app.services.ingest_batch import IngestBatchService
 from app.services.field_parser import FieldParserService
 from app.services.raw_records import RawRecordsService
@@ -25,6 +26,7 @@ from app.services.data_lineage import DataLineageService
 
 SERVICES: dict[str, BaseModuleService] = {
     "source_registry": SourceRegistryService(),
+    "verification_receipt": VerificationReceiptService(),
     "ingest_batch": IngestBatchService(),
     "field_parser": FieldParserService(),
     "raw_records": RawRecordsService(),

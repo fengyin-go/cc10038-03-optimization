@@ -25,6 +25,17 @@ export const MODULES: ModuleMeta[] = [
     metrics: ["批次总数", "已完成批次", "待处理批次"],
   },
   {
+    key: "verification_receipt",
+    name: "复验清单",
+    entity: "验证回执",
+    desc: "记录数据源每次验证的版本回执与接收统计，便于排查新旧地址的记录归属",
+    fields: ["来源标识", "验证版本", "接入参数摘要", "验证时间", "回执状态"],
+    statuses: ["当前版本", "历史版本"],
+    actions: [],
+    actionTargets: {},
+    metrics: ["回执总数", "当前版本", "历史版本"],
+  },
+  {
     key: "field_parser",
     name: "字段解析规则",
     entity: "解析规则",

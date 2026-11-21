@@ -452,3 +452,278 @@ class TestCrossModuleSnapshot:
 
         raw_snap = SERVICES["raw_records"].domain_snapshot()
         assert raw_snap["count"] > 0
+
+
+class TestSourceRevalidation:
+    """数据源复验与迟到日志补采测试：核对实际来源验证版本、
+    已确认批次不回退、相同尾包只记一次、接收结果回写复验清单。"""
+
+    def _receipts_of(self, source_id):
+        return [r for r in store.rows("verification_receipt")
+                if r.get("来源标识") == source_id]
+
+    def _batch_of(self, batch_no):
+        return next(b for b in store.rows("ingest_batch") if b.get("批次编号") == batch_no)
+
+    def test_revalidate_with_changed_params_writes_receipt(self, pipeline):
+        pipeline.register_source("rev-src", "http", "default")
+        pipeline.validate_source("rev-src", {"endpoint": "http://old:9001/logs"})
+        result = pipeline.validate_source("rev-src", {"endpoint": "http://new:9002/logs"})
+        assert result["ok"] is True
+        assert result["params_changed"] is True
+        assert result["entry"]["source_version"] == 3
+        assert result["entry"]["接入地址"] == "http://new:9002/logs"
+
+        receipts = self._receipts_of("rev-src")
+        assert len(receipts) == 2
+        current = [r for r in receipts if r["status"] == "当前版本"]
+        history = [r for r in receipts if r["status"] == "历史版本"]
+        assert len(current) == 1 and current[0]["source_version"] == 3
+        assert len(history) == 1 and history[0]["source_version"] == 2
+        assert current[0]["接入参数摘要"] != history[0]["接入参数摘要"]
+
+    def test_revalidate_without_param_change(self, pipeline):
+        pipeline.register_source("stable-src", "http", "default")
+        pipeline.validate_source("stable-src", {"endpoint": "http://a:1/logs"})
+        result = pipeline.validate_source("stable-src", {"endpoint": "http://a:1/logs"})
+        assert result["ok"] is True
+        assert result["params_changed"] is False
+        assert result["entry"]["source_version"] == 3
+
+    def test_validate_keeps_backward_compatible_receipt(self, pipeline):
+        """兼容已有验证路径：不带参数的验证同样写回执。"""
+        pipeline.register_source("plain-src", "http", "default")
+        result = pipeline.validate_source("plain-src")
+        assert result["ok"] is True
+        receipts = self._receipts_of("plain-src")
+        assert len(receipts) == 1
+        assert receipts[0]["source_version"] == 2
+        assert receipts[0]["status"] == "当前版本"
+
+    def test_receive_rejects_unmatched_version(self, pipeline):
+        """复验与补采并发时，只接受来源和验证版本对得上的记录。"""
+        pipeline.register_source("mis-src", "http", "default")
+        pipeline.validate_source("mis-src")
+        # 从未验证过的版本（登记时是 v1，验证后当前为 v2）
+        result = pipeline.receive_buffered_logs("mis-src", 1, "2026-01-15", [{"body": "a|b|c"}])
+        assert result["ok"] is False
+        assert "未通过验证" in result["message"]
+        # 超出当前版本的将来版本
+        result = pipeline.receive_buffered_logs("mis-src", 99, "2026-01-15", [{"body": "a|b|c"}])
+        assert result["ok"] is False
+        assert "未通过验证" in result["message"]
+
+    def test_receive_unregistered_source(self, pipeline):
+        result = pipeline.receive_buffered_logs("ghost-src", 1, "w", [{"body": "x|y"}])
+        assert result["ok"] is False
+        assert "未登记" in result["message"]
+
+    def test_late_tail_and_new_address_batches(self, pipeline):
+        """主场景：先验证旧地址并完成一批，再改接入参数后补交旧地址的
+        尾包和新地址的一批日志，检查两次接收状态和各批的来源版本。"""
+        # 1) 验证旧地址并完成一批
+        pipeline.register_source("switch-src", "http", "default")
+        pipeline.validate_source("switch-src", {"endpoint": "http://old:9001/logs"})
+        old_logs = [
+            {"body": "2026-01-15T10:00:00|INFO|old-1"},
+            {"body": "2026-01-15T10:01:00|WARN|old-2"},
+        ]
+        first = pipeline.start_ingest_batch("switch-src", "2026-01-15", old_logs)
+        first_batch = first["batch"]["批次编号"]
+        assert first["batch"]["source_version"] == 2
+        pipeline.parse_batch(first_batch)
+        assert self._batch_of(first_batch)["status"] == "已完成"
+
+        # 2) 更改接入参数后重新验证（新地址通过）
+        rev = pipeline.validate_source("switch-src", {"endpoint": "http://new:9002/logs"})
+        assert rev["params_changed"] is True
+        assert rev["entry"]["source_version"] == 3
+
+        # 3) 旧地址积压的迟到尾包补交（仍用旧版本 v2）
+        tail = [
+            {"body": "2026-01-15T10:02:00|ERROR|old-tail-1"},
+            {"body": "2026-01-15T10:03:00|INFO|old-tail-2"},
+        ]
+        late_result = pipeline.receive_buffered_logs(
+            "switch-src", 2, "2026-01-15", tail, package_id="tail-old-1")
+        assert late_result["ok"] is True
+        assert late_result["late"] is True
+        assert late_result["supplementary"] is True
+        assert late_result["supplementary_of"] == first_batch
+        assert late_result["accepted"] == 2
+        assert late_result["source_version"] == 2
+        assert late_result["current_source_version"] == 3
+        late_batch = late_result["batch_no"]
+        assert late_batch != first_batch
+
+        # 已确认批次不允许回退
+        assert self._batch_of(first_batch)["status"] == "已完成"
+
+        # 4) 新地址的一批日志（当前版本 v3）
+        new_result = pipeline.receive_buffered_logs(
+            "switch-src", 3, "2026-01-15",
+            [{"body": "2026-01-15T11:00:00|INFO|new-1"}], package_id="new-batch-1")
+        assert new_result["ok"] is True
+        assert new_result["late"] is False
+        assert new_result["supplementary"] is False
+        assert new_result["source_version"] == 3
+        new_batch = new_result["batch_no"]
+
+        # 5) 检查两次接收状态和各批的来源版本
+        assert self._batch_of(first_batch)["source_version"] == 2
+        assert self._batch_of(late_batch)["source_version"] == 2
+        assert self._batch_of(late_batch)["late"] is True
+        assert self._batch_of(new_batch)["source_version"] == 3
+
+        raws = store.rows("raw_records")
+        late_raws = [r for r in raws if r.get("批次编号") == late_batch]
+        assert len(late_raws) == 2
+        assert all(r["source_version"] == 2 for r in late_raws)
+        new_raws = [r for r in raws if r.get("批次编号") == new_batch]
+        assert len(new_raws) == 1
+        assert all(r["source_version"] == 3 for r in new_raws)
+
+    def test_duplicate_tail_package_recorded_once(self, pipeline):
+        """再提交相同的尾包，只记一次原始行。"""
+        pipeline.register_source("dup-pkg-src", "http", "default")
+        pipeline.validate_source("dup-pkg-src")
+        tail = [{"body": "t1|INFO|m1"}, {"body": "t2|WARN|m2"}]
+        first = pipeline.receive_buffered_logs(
+            "dup-pkg-src", 2, "2026-01-15", tail, package_id="tail-1")
+        assert first["ok"] is True
+        assert first["accepted"] == 2
+
+        again = pipeline.receive_buffered_logs(
+            "dup-pkg-src", 2, "2026-01-15", tail, package_id="tail-1")
+        assert again["ok"] is True
+        assert again["duplicate_package"] is True
+        assert again["accepted"] == 0
+        assert again["batch_no"] == first["batch_no"]
+
+        # 未显式传 package_id 时，按内容摘要识别同一尾包
+        third = pipeline.receive_buffered_logs("dup-pkg-src", 2, "2026-01-15", tail)
+        assert third["duplicate_package"] is True
+
+        raws = [r for r in store.rows("raw_records")
+                if r.get("source_id") == "dup-pkg-src"]
+        assert len(raws) == 2
+
+    def test_receive_appends_to_open_batch_and_dedup_lines(self, pipeline):
+        """同源同版本同窗口的进行中批次直接追加；行级去重。"""
+        pipeline.register_source("append-src", "http", "default")
+        pipeline.validate_source("append-src")
+        started = pipeline.start_ingest_batch(
+            "append-src", "2026-01-15", [{"body": "t1|INFO|m1"}])
+        batch_no = started["batch"]["批次编号"]
+
+        result = pipeline.receive_buffered_logs(
+            "append-src", 2, "2026-01-15",
+            [{"body": "t1|INFO|m1"}, {"body": "t2|WARN|m2"}], package_id="pkg-2")
+        assert result["ok"] is True
+        assert result["batch_no"] == batch_no
+        assert result["supplementary"] is False
+        assert result["accepted"] == 1
+        assert result["skipped_duplicates"] == 1
+        assert self._batch_of(batch_no)["记录总数"] == "2"
+        # 行号连续递增
+        raws = sorted(
+            (r for r in store.rows("raw_records") if r.get("批次编号") == batch_no),
+            key=lambda r: int(r["原始行号"]),
+        )
+        assert [r["原始行号"] for r in raws] == ["1", "2"]
+
+    def test_confirmed_batch_never_rolled_back(self, pipeline):
+        """补采不动已确认批次：状态、版本都保持。"""
+        pipeline.register_source("noroll-src", "http", "default")
+        pipeline.validate_source("noroll-src")
+        started = pipeline.start_ingest_batch(
+            "noroll-src", "2026-01-15", [{"body": "t1|INFO|m1"}])
+        batch_no = started["batch"]["批次编号"]
+        pipeline.parse_batch(batch_no)
+        before = dict(self._batch_of(batch_no))
+
+        pipeline.receive_buffered_logs(
+            "noroll-src", 2, "2026-01-15", [{"body": "t2|WARN|late"}], package_id="late-1")
+        after = self._batch_of(batch_no)
+        assert after["status"] == before["status"] == "已完成"
+        assert after["记录总数"] == before["记录总数"] == "1"
+
+    def test_receive_writes_back_receipt(self, pipeline):
+        """接收结果回写复验清单，旧地址和新地址的记录可分别排查。"""
+        pipeline.register_source("ledger-src", "http", "default")
+        pipeline.validate_source("ledger-src", {"endpoint": "http://old:1/logs"})
+        started = pipeline.start_ingest_batch("ledger-src", "w1", [{"body": "a|b|c"}])
+        pipeline.parse_batch(started["batch"]["批次编号"])  # 首批确认完成
+        pipeline.validate_source("ledger-src", {"endpoint": "http://new:2/logs"})
+
+        pipeline.receive_buffered_logs(
+            "ledger-src", 2, "w1", [{"body": "d|e|f"}, {"body": "g|h|i"}], package_id="p1")
+        pipeline.receive_buffered_logs(
+            "ledger-src", 3, "w1", [{"body": "j|k|l"}], package_id="p2")
+
+        receipts = {r["source_version"]: r for r in self._receipts_of("ledger-src")}
+        assert receipts[2]["received_records"] == 3  # 旧地址：首批 1 行 + 迟到 2 行
+        assert receipts[2]["received_batches"] == 2
+        assert receipts[2]["last_received_at"] != ""
+        assert receipts[3]["received_records"] == 1  # 新地址：1 行
+        assert receipts[3]["received_batches"] == 1
+
+    def test_raw_records_carry_source_version(self, pipeline):
+        """采集批次创建原始记录时写下这批实际使用的来源验证版本。"""
+        pipeline.register_source("carry-src", "http", "default")
+        pipeline.validate_source("carry-src")
+        result = pipeline.start_ingest_batch(
+            "carry-src", "w1", [{"body": "a|b|c"}, {"body": "d|e|f"}])
+        batch_no = result["batch"]["批次编号"]
+        raws = [r for r in store.rows("raw_records") if r.get("批次编号") == batch_no]
+        assert len(raws) == 2
+        assert all(r["source_version"] == 2 for r in raws)
+
+    def test_legacy_validated_source_backfills_receipt(self, pipeline):
+        """兼容已有验证回执缺失的旧数据：按当前版本补建回执后正常接收。"""
+        pipeline.register_source("legacy-src", "http", "default")
+        source = next(s for s in store.rows("source_registry")
+                      if s.get("来源标识") == "legacy-src")
+        # 模拟旧数据：已验证但没有任何回执
+        source["status"] = "已验证"
+        source["source_version"] = 5
+
+        result = pipeline.receive_buffered_logs(
+            "legacy-src", 5, "w1", [{"body": "a|b|c"}], package_id="p1")
+        assert result["ok"] is True
+        receipts = self._receipts_of("legacy-src")
+        assert len(receipts) == 1
+        assert receipts[0]["backfilled"] is True
+        assert receipts[0]["source_version"] == 5
+        assert receipts[0]["received_records"] == 1
+
+    def test_reception_overview_shows_parse_ready(self, pipeline):
+        """值班端能看清各批哪些输入已经能进入解析。"""
+        pipeline.register_source("duty-src", "http", "default")
+        pipeline.validate_source("duty-src", {"endpoint": "http://old:1/logs"})
+        started = pipeline.start_ingest_batch("duty-src", "w1", [{"body": "a|b|c"}])
+        first_batch = started["batch"]["批次编号"]
+        pipeline.parse_batch(first_batch)  # 首批确认完成，记录进入已解析
+        pipeline.validate_source("duty-src", {"endpoint": "http://new:2/logs"})
+        late = pipeline.receive_buffered_logs(
+            "duty-src", 2, "w1", [{"body": "d|e|f"}], package_id="late-1")
+
+        overview = pipeline.reception_overview("duty-src")
+        assert overview["ok"] is True
+        entry = overview["sources"][0]
+        assert entry["当前验证版本"] == 3
+        assert len(entry["复验清单"]) == 2
+        batches = {b["批次编号"]: b for b in entry["批次"]}
+        assert set(batches) == {first_batch, late["batch_no"]}
+
+        confirmed = batches[first_batch]
+        assert confirmed["status"] == "已完成"
+        assert confirmed["可进入解析"] is False  # 已解析完毕，无待解析输入
+        assert confirmed["source_version"] == 2
+
+        supplementary = batches[late["batch_no"]]
+        assert supplementary["可进入解析"] is True  # 迟到补采的输入可进入解析
+        assert supplementary["待解析"] == 1
+        assert supplementary["late"] is True
+        assert supplementary["supplementary"] is True
+        assert supplementary["source_version"] == 2

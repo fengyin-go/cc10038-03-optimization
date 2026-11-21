@@ -17,6 +17,19 @@ class SourceRegisterPayload(BaseModel):
     region: str = "default"
 
 
+class SourceRevalidatePayload(BaseModel):
+    source_id: str = Field(..., min_length=1)
+    access_params: dict[str, str] = Field(default_factory=dict)
+
+
+class ReceiveLogsPayload(BaseModel):
+    source_id: str = Field(..., min_length=1)
+    source_version: int
+    time_window: str = Field(..., min_length=1)
+    raw_logs: list[dict[str, Any]] = Field(default_factory=list)
+    package_id: str | None = None
+
+
 class IngestBatchPayload(BaseModel):
     source_id: str = Field(..., min_length=1)
     time_window: str = Field(..., min_length=1)
@@ -80,6 +93,32 @@ def pipeline_register_source(payload: SourceRegisterPayload) -> dict[str, Any]:
 @router.post("/source/validate")
 def pipeline_validate_source(source_id: str = Query(..., min_length=1)) -> dict[str, Any]:
     return pipeline.validate_source(source_id)
+
+
+@router.post("/source/revalidate")
+def pipeline_revalidate_source(payload: SourceRevalidatePayload) -> dict[str, Any]:
+    """更改接入参数后重新验证：参数变化会写入来源并递增验证版本。"""
+    return pipeline.validate_source(payload.source_id, payload.access_params)
+
+
+@router.post("/batch/receive")
+def pipeline_receive_logs(payload: ReceiveLogsPayload) -> dict[str, Any]:
+    """接收迟到的缓冲日志：核对来源验证版本，已确认批次不回退，尾包幂等。"""
+    return pipeline.receive_buffered_logs(
+        payload.source_id,
+        payload.source_version,
+        payload.time_window,
+        payload.raw_logs,
+        payload.package_id,
+    )
+
+
+@router.get("/reception/overview")
+def pipeline_reception_overview(
+    source_id: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """值班端接收总览：各来源验证版本、复验清单接收统计与批次可解析状态。"""
+    return pipeline.reception_overview(source_id)
 
 
 @router.post("/batch/start")

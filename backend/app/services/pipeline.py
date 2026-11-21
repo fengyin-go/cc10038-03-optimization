@@ -1,6 +1,26 @@
 """跨模块数据采集流水线：编排 source_registry → ingest_batch → raw_records
 → field_parser → parsed_entity → dedup_engine → aggregation_view → data_export
 的完整数据链路，包含版本追踪、失败恢复、批次去重和水位管理。
+
+状态流转梳理（数据源复验与批次接收）：
+
+数据源（source_registry）：待验证 → 已验证 → 已停用。
+  每次验证（含更改接入参数后的重新验证）使 source_version 递增，
+  并写入一条验证回执（verification_receipt，即复验清单）：新回执为
+  「当前版本」，旧回执转为「历史版本」，仍可作为迟到日志的接收依据。
+
+采集批次（ingest_batch）：待采集 → 采集中 → 已完成 / 部分失败。
+  已确认批次（已完成 / 部分失败）不允许回退；迟到缓冲日志走补采通道：
+  同源同版本同窗口的进行中批次直接追加，否则新开补采批次并标记
+  supplementary，原已确认批次保持原状态。
+
+接收依据（receive_buffered_logs）：
+  1. 来源已登记；
+  2. 提交的来源验证版本命中该来源的验证回执——复验与补采并发时，
+     只接受来源和验证版本对得上的记录；
+  3. 相同尾包（package_id）重复提交只记一次原始行；
+  4. 原始记录写下本批实际使用的来源验证版本，接收结果回写复验清单，
+     便于排查旧地址和新地址的记录。
 """
 from __future__ import annotations
 
@@ -30,6 +50,91 @@ class IngestPipeline:
     """采集流水线统一编排，管理从数据源到导出的完整数据链路。"""
 
     # ---------- 阶段0：数据源登记与版本 ----------
+    def _find_source(self, source_id: str) -> dict[str, Any] | None:
+        for s in store.rows("source_registry"):
+            if s.get("来源标识") == source_id:
+                return s
+        return None
+
+    @staticmethod
+    def _params_digest(source_entry: dict[str, Any]) -> str:
+        """接入参数摘要：协议 + 接入地址 + 连接凭证，用于识别参数变化。"""
+        return _stable_digest({
+            "protocol": source_entry.get("接入协议", ""),
+            "endpoint": source_entry.get("接入地址", ""),
+            "credential": source_entry.get("连接凭证", ""),
+        })
+
+    def _apply_access_params(
+        self,
+        source_entry: dict[str, Any],
+        access_params: dict[str, Any],
+    ) -> bool:
+        """把新接入参数写入来源，返回参数是否发生变化。"""
+        mapping = {"protocol": "接入协议", "endpoint": "接入地址", "credential": "连接凭证"}
+        changed = False
+        for key, field in mapping.items():
+            value = access_params.get(key)
+            if value is not None and str(value) != str(source_entry.get(field, "")):
+                source_entry[field] = str(value)
+                changed = True
+        if changed:
+            source_entry["params_digest"] = self._params_digest(source_entry)
+        return changed
+
+    # ----- 验证回执（复验清单） -----
+    def _receipts(self) -> list[dict[str, Any]]:
+        return store.rows("verification_receipt")
+
+    def _find_receipt(self, source_id: str, source_version: int) -> dict[str, Any] | None:
+        for r in self._receipts():
+            if r.get("来源标识") == source_id and r.get("source_version") == source_version:
+                return r
+        return None
+
+    def _write_receipt(
+        self,
+        source_entry: dict[str, Any],
+        params_changed: bool,
+        backfilled: bool = False,
+    ) -> dict[str, Any]:
+        """每次验证写一条回执；旧的「当前版本」回执转为「历史版本」。"""
+        source_id = source_entry.get("来源标识")
+        version = source_entry.get("source_version", 1)
+        for r in self._receipts():
+            if r.get("来源标识") == source_id and r.get("status") == "当前版本":
+                r["status"] = "历史版本"
+                r["回执状态"] = "历史版本"
+        receipt = {
+            "id": _next_id("verification_receipt"),
+            "来源标识": source_id,
+            "验证版本": f"v{version}",
+            "接入参数摘要": source_entry.get("params_digest") or self._params_digest(source_entry),
+            "验证时间": _now_iso(),
+            "回执状态": "当前版本",
+            "status": "当前版本",
+            "pending": False,
+            "abnormal": False,
+            "source_version": version,
+            "params_changed": params_changed,
+            "backfilled": backfilled,
+            "received_batches": 0,
+            "received_records": 0,
+            "last_received_at": "",
+        }
+        self._receipts().append(receipt)
+        return receipt
+
+    def _ensure_current_receipt(self, source_entry: dict[str, Any]) -> dict[str, Any] | None:
+        """兼容已有验证数据：已验证来源缺少当前版本回执时按现状补建。"""
+        if source_entry.get("status") != "已验证":
+            return None
+        receipt = self._find_receipt(
+            source_entry.get("来源标识"), source_entry.get("source_version", 1))
+        if receipt is None:
+            receipt = self._write_receipt(source_entry, params_changed=False, backfilled=True)
+        return receipt
+
     def register_source(self, source_id: str, protocol: str, region: str) -> dict[str, Any]:
         sources = store.rows("source_registry")
         for s in sources:
@@ -39,6 +144,7 @@ class IngestPipeline:
             "id": _next_id("source_registry"),
             "来源标识": source_id,
             "接入协议": protocol,
+            "接入地址": "",
             "连接凭证": f"token-{_stable_digest({'source': source_id})}",
             "采集区域": region,
             "状态": source_id,
@@ -48,20 +154,37 @@ class IngestPipeline:
             "source_version": 1,
             "registered_at": _now_iso(),
         }
+        entry["params_digest"] = self._params_digest(entry)
         sources.append(entry)
         return {"ok": True, "message": "数据源已登记", "entry": entry}
 
-    def validate_source(self, source_id: str) -> dict[str, Any]:
-        sources = store.rows("source_registry")
-        for s in sources:
-            if s.get("来源标识") == source_id:
-                s["status"] = "已验证"
-                s["pending"] = False
-                s["abnormal"] = False
-                s["source_version"] = s.get("source_version", 1) + 1
-                s["validated_at"] = _now_iso()
-                return {"ok": True, "message": f"数据源 {source_id} 已验证", "entry": s}
-        return {"ok": False, "message": f"数据源 {source_id} 不存在"}
+    def validate_source(
+        self,
+        source_id: str,
+        access_params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """验证/复验数据源。提供 access_params 时按新接入参数重新验证：
+        参数变化会更新来源接入配置；每次验证递增版本并写验证回执。"""
+        source_entry = self._find_source(source_id)
+        if source_entry is None:
+            return {"ok": False, "message": f"数据源 {source_id} 不存在"}
+        params_changed = self._apply_access_params(source_entry, access_params or {})
+        source_entry["status"] = "已验证"
+        source_entry["pending"] = False
+        source_entry["abnormal"] = False
+        source_entry["source_version"] = source_entry.get("source_version", 1) + 1
+        source_entry["validated_at"] = _now_iso()
+        receipt = self._write_receipt(source_entry, params_changed)
+        message = f"数据源 {source_id} 已验证"
+        if params_changed:
+            message = f"数据源 {source_id} 已按新接入参数复验"
+        return {
+            "ok": True,
+            "message": message,
+            "entry": source_entry,
+            "receipt": receipt,
+            "params_changed": params_changed,
+        }
 
     # ---------- 阶段1：采集批次启动 ----------
     def start_ingest_batch(
@@ -81,6 +204,9 @@ class IngestPipeline:
             return {"ok": False, "message": f"数据源 {source_id} 未登记"}
         if source_entry.get("status") != "已验证":
             return {"ok": False, "message": f"数据源 {source_id} 未通过验证"}
+        # 兼容已有验证数据：确保当前版本有回执，接收结果稍后会回写
+        receipt = self._ensure_current_receipt(source_entry)
+        current_version = source_entry.get("source_version", 1)
 
         # 检查是否有未完成的同源批次
         batches = store.rows("ingest_batch")
@@ -100,12 +226,14 @@ class IngestPipeline:
             "pending": True,
             "abnormal": False,
             "batch_version": 1,
-            "source_version": source_entry.get("source_version", 1),
+            "source_version": current_version,
+            "late": False,
+            "supplementary": False,
             "started_at": _now_iso(),
         }
         batches.append(batch_entry)
 
-        # 生成原始日志记录
+        # 生成原始日志记录：写下这批实际使用的来源验证版本
         raw_records_list = store.rows("raw_records")
         created_ids: list[int] = []
         if raw_logs:
@@ -123,6 +251,8 @@ class IngestPipeline:
                     "abnormal": False,
                     "batch_version": 1,
                     "source_id": source_id,
+                    "source_version": current_version,
+                    "package_id": str(log.get("package_id", "")) if isinstance(log, dict) else "",
                     "ingested_at": _now_iso(),
                 }
                 raw_records_list.append(record)
@@ -130,12 +260,352 @@ class IngestPipeline:
 
         batch_entry["记录总数"] = str(len(created_ids))
         batch_entry["raw_record_ids"] = json.dumps(created_ids)
+        # 接收结果回写复验清单
+        if receipt is not None:
+            self._write_back_receipt(receipt, source_id, current_version)
         return {
             "ok": True,
             "message": f"采集批次 {batch_no} 已启动",
             "batch": batch_entry,
             "record_count": len(created_ids),
         }
+
+    # ---------- 阶段1.5：迟到缓冲日志接收（补采） ----------
+    OPEN_BATCH_STATUS = ("待采集", "采集中")
+    CONFIRMED_BATCH_STATUS = ("已完成", "部分失败")
+
+    def receive_buffered_logs(
+        self,
+        source_id: str,
+        source_version: int,
+        time_window: str,
+        raw_logs: list[dict[str, Any]] | None = None,
+        package_id: str | None = None,
+    ) -> dict[str, Any]:
+        """接收迟到的缓冲日志：核对实际来源验证版本后写入原始记录。
+
+        只接受来源和验证版本对得上的记录；已确认批次不回退，需要补采时
+        新开补采批次；相同尾包重复提交只记一次原始行。
+        """
+        source_entry = self._find_source(source_id)
+        if source_entry is None:
+            return {"ok": False, "message": f"数据源 {source_id} 未登记"}
+        # 兼容已有验证数据：已验证来源缺回执时先补建
+        self._ensure_current_receipt(source_entry)
+
+        try:
+            version = int(source_version)
+        except (TypeError, ValueError):
+            return {"ok": False, "message": f"来源验证版本 {source_version!r} 无法识别，拒收"}
+
+        # 核对实际来源验证版本：必须命中该来源的验证回执
+        receipt = self._find_receipt(source_id, version)
+        if receipt is None:
+            current = source_entry.get("source_version", 1)
+            return {
+                "ok": False,
+                "message": f"数据源 {source_id} 的验证版本 v{version} 未通过验证（当前 v{current}），拒收",
+            }
+
+        raw_logs = raw_logs or []
+        current_version = source_entry.get("source_version", 1)
+        late = version < current_version
+
+        # 尾包幂等：相同尾包重复提交只记一次原始行。
+        # 内容摘要始终计算：调用方未传 package_id 或前后两次传法不一致时，
+        # 仍能按内容识别同一尾包。
+        package_digest = "pkg-" + _stable_digest({
+            "source": source_id, "version": version,
+            "window": time_window, "logs": raw_logs,
+        })
+        if not package_id:
+            package_id = package_digest
+        existing = self._find_package_reception(source_id, version, package_id, package_digest)
+        if existing is not None:
+            existing.update({
+                "ok": True,
+                "duplicate_package": True,
+                "current_source_version": current_version,
+                "message": f"尾包 {package_id} 已接收过，本次不重复记录",
+            })
+            return existing
+
+        # 批次归属：进行中批次直接追加；已确认批次不回退，新开补采批次
+        batch = self._find_batch(source_id, version, time_window, self.OPEN_BATCH_STATUS)
+        supplementary_of = ""
+        if batch is None:
+            confirmed = self._find_batch(source_id, version, time_window, self.CONFIRMED_BATCH_STATUS)
+            if confirmed is not None:
+                supplementary_of = confirmed.get("批次编号", "")
+            batch = self._new_receive_batch(source_entry, version, time_window, late, supplementary_of)
+
+        created_ids, skipped = self._append_raw_logs(
+            batch, source_id, version, raw_logs, package_id, package_digest)
+        self._refresh_batch_total(batch)
+        # 接收结果回写复验清单
+        self._write_back_receipt(receipt, source_id, version)
+
+        batch_no = batch["批次编号"]
+        return {
+            "ok": True,
+            "message": self._receive_message(batch_no, version, late, len(created_ids), skipped),
+            "batch_no": batch_no,
+            "source_version": version,
+            "current_source_version": current_version,
+            "late": late,
+            "supplementary": bool(supplementary_of),
+            "supplementary_of": supplementary_of,
+            "package_id": package_id,
+            "accepted": len(created_ids),
+            "skipped_duplicates": skipped,
+            "duplicate_package": False,
+            "parse_ready": self._parse_ready_count(batch_no),
+        }
+
+    def _find_batch(
+        self,
+        source_id: str,
+        source_version: int,
+        time_window: str,
+        statuses: tuple[str, ...],
+    ) -> dict[str, Any] | None:
+        for b in store.rows("ingest_batch"):
+            if (b.get("所属数据源") == source_id
+                    and b.get("source_version") == source_version
+                    and b.get("采集时间窗口") == time_window
+                    and b.get("status") in statuses):
+                return b
+        return None
+
+    def _new_receive_batch(
+        self,
+        source_entry: dict[str, Any],
+        source_version: int,
+        time_window: str,
+        late: bool,
+        supplementary_of: str,
+    ) -> dict[str, Any]:
+        batches = store.rows("ingest_batch")
+        batch_no = f"INGE-{_next_id('ingest_batch'):04d}"
+        batch_entry = {
+            "id": _next_id("ingest_batch"),
+            "批次编号": batch_no,
+            "所属数据源": source_entry.get("来源标识"),
+            "采集时间窗口": time_window,
+            "记录总数": "0",
+            "批次状态": time_window,
+            "status": "采集中",
+            "pending": True,
+            "abnormal": False,
+            "batch_version": 1,
+            "source_version": source_version,
+            "late": late,
+            "supplementary": bool(supplementary_of),
+            "supplementary_of": supplementary_of,
+            "started_at": _now_iso(),
+        }
+        batches.append(batch_entry)
+        return batch_entry
+
+    def _append_raw_logs(
+        self,
+        batch: dict[str, Any],
+        source_id: str,
+        source_version: int,
+        raw_logs: list[dict[str, Any]],
+        package_id: str,
+        package_digest: str = "",
+    ) -> tuple[list[int], int]:
+        """向批次追加原始记录：行级去重，记录写下实际使用的来源验证版本。"""
+        batch_no = batch["批次编号"]
+        raws = store.rows("raw_records")
+        batch_raw = [r for r in raws if r.get("批次编号") == batch_no]
+        seen = {_stable_digest({"body": r.get("原始正文", "")}) for r in batch_raw}
+        line_no = 0
+        for r in batch_raw:
+            try:
+                line_no = max(line_no, int(r.get("原始行号", "0")))
+            except (TypeError, ValueError):
+                continue
+        created_ids: list[int] = []
+        skipped = 0
+        for log in raw_logs:
+            body = log.get("body", str(log)) if isinstance(log, dict) else str(log)
+            digest = _stable_digest({"body": body})
+            if digest in seen:
+                skipped += 1
+                continue
+            seen.add(digest)
+            line_no += 1
+            raw_id = _next_id("raw_records")
+            raws.append({
+                "id": raw_id,
+                "批次编号": batch_no,
+                "原始行号": str(line_no),
+                "采集时间戳": _now_iso(),
+                "原始正文": body,
+                "解析状态": "未解析",
+                "status": "待解析",
+                "pending": True,
+                "abnormal": False,
+                "batch_version": batch.get("batch_version", 1),
+                "source_id": source_id,
+                "source_version": source_version,
+                "package_id": package_id,
+                "package_digest": package_digest,
+                "ingested_at": _now_iso(),
+            })
+            created_ids.append(raw_id)
+        try:
+            ids = json.loads(batch.get("raw_record_ids", "[]"))
+        except (json.JSONDecodeError, TypeError):
+            ids = []
+        ids.extend(created_ids)
+        batch["raw_record_ids"] = json.dumps(ids)
+        return created_ids, skipped
+
+    def _refresh_batch_total(self, batch: dict[str, Any]) -> None:
+        total = sum(1 for r in store.rows("raw_records")
+                    if r.get("批次编号") == batch["批次编号"])
+        batch["记录总数"] = str(total)
+
+    def _parse_ready_count(self, batch_no: str) -> int:
+        """值班端视角：该批次已进入待解析、可以被解析的记录数。"""
+        return sum(1 for r in store.rows("raw_records")
+                   if r.get("批次编号") == batch_no and r.get("status") == "待解析")
+
+    def _find_package_reception(
+        self,
+        source_id: str,
+        source_version: int,
+        package_id: str,
+        package_digest: str = "",
+    ) -> dict[str, Any] | None:
+        """按尾包标识或内容摘要查找已接收记录，命中即视为重复提交。"""
+        records = [
+            r for r in store.rows("raw_records")
+            if r.get("source_id") == source_id
+            and r.get("source_version") == source_version
+            and (r.get("package_id") == package_id
+                 or (package_digest and r.get("package_digest") == package_digest))
+        ]
+        if not records:
+            return None
+        batch_no = records[0].get("批次编号")
+        batch = next(
+            (b for b in store.rows("ingest_batch") if b.get("批次编号") == batch_no), {})
+        return {
+            "batch_no": batch_no,
+            "source_version": source_version,
+            "late": bool(batch.get("late")),
+            "supplementary": bool(batch.get("supplementary")),
+            "supplementary_of": batch.get("supplementary_of", ""),
+            "package_id": package_id,
+            "accepted": 0,
+            "skipped_duplicates": 0,
+            "parse_ready": self._parse_ready_count(batch_no),
+        }
+
+    @staticmethod
+    def _receive_message(
+        batch_no: str, version: int, late: bool, accepted: int, skipped: int,
+    ) -> str:
+        tag = "迟到补采" if late else "接收"
+        message = f"批次 {batch_no} {tag}完成：版本 v{version} 接收 {accepted} 行"
+        if skipped:
+            message += f"，跳过重复 {skipped} 行"
+        return message
+
+    def _batch_source(self, batch_no: str) -> str | None:
+        for b in store.rows("ingest_batch"):
+            if b.get("批次编号") == batch_no:
+                return b.get("所属数据源")
+        return None
+
+    def _raw_version(self, raw: dict[str, Any]) -> int | None:
+        """兼容旧记录：缺 source_version 时回退到所属批次的来源版本。"""
+        version = raw.get("source_version")
+        if version is not None:
+            return version
+        for b in store.rows("ingest_batch"):
+            if b.get("批次编号") == raw.get("批次编号"):
+                return b.get("source_version")
+        return None
+
+    def _write_back_receipt(
+        self,
+        receipt: dict[str, Any],
+        source_id: str,
+        source_version: int,
+    ) -> None:
+        """接收结果回写复验清单：按原始记录实际归属重算该版本的接收统计。"""
+        matched = []
+        for r in store.rows("raw_records"):
+            if self._raw_version(r) != source_version:
+                continue
+            if r.get("source_id") == source_id or self._batch_source(r.get("批次编号", "")) == source_id:
+                matched.append(r)
+        receipt["received_batches"] = len({r.get("批次编号") for r in matched})
+        receipt["received_records"] = len(matched)
+        receipt["last_received_at"] = _now_iso()
+
+    # ---------- 值班端接收总览 ----------
+    def reception_overview(self, source_id: str | None = None) -> dict[str, Any]:
+        """值班端视图：各来源的验证版本、复验清单接收统计与批次可解析状态。"""
+        sources = store.rows("source_registry")
+        receipts = store.rows("verification_receipt")
+        batches = store.rows("ingest_batch")
+        raws = store.rows("raw_records")
+
+        if source_id:
+            source_ids = [source_id]
+        else:
+            source_ids = sorted(
+                {str(s.get("来源标识")) for s in sources if s.get("来源标识")}
+                | {str(b.get("所属数据源")) for b in batches if b.get("所属数据源")}
+            )
+
+        overview: list[dict[str, Any]] = []
+        for sid in source_ids:
+            source_entry = self._find_source(sid)
+            batch_views = []
+            for b in batches:
+                if b.get("所属数据源") != sid:
+                    continue
+                batch_no = b.get("批次编号")
+                b_raw = [r for r in raws if r.get("批次编号") == batch_no]
+                parse_ready = sum(1 for r in b_raw if r.get("status") == "待解析")
+                batch_views.append({
+                    "批次编号": batch_no,
+                    "source_version": b.get("source_version"),
+                    "status": b.get("status"),
+                    "记录总数": len(b_raw),
+                    "待解析": parse_ready,
+                    "可进入解析": parse_ready > 0,
+                    "late": bool(b.get("late")),
+                    "supplementary": bool(b.get("supplementary")),
+                })
+            receipt_views = [
+                {
+                    "验证版本": r.get("验证版本"),
+                    "source_version": r.get("source_version"),
+                    "回执状态": r.get("status"),
+                    "接入参数摘要": r.get("接入参数摘要"),
+                    "验证时间": r.get("验证时间"),
+                    "received_batches": r.get("received_batches", 0),
+                    "received_records": r.get("received_records", 0),
+                    "last_received_at": r.get("last_received_at", ""),
+                }
+                for r in receipts if r.get("来源标识") == sid
+            ]
+            overview.append({
+                "来源标识": sid,
+                "来源状态": source_entry.get("status") if source_entry else "未登记",
+                "当前验证版本": source_entry.get("source_version") if source_entry else None,
+                "复验清单": receipt_views,
+                "批次": batch_views,
+            })
+        return {"ok": True, "sources": overview}
 
     # ---------- 阶段2：字段解析 ----------
     def parse_batch(
